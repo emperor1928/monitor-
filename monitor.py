@@ -268,7 +268,7 @@ def run_esl_listener():
             
             # Subscribe to events
             # Using CHANNEL_HANGUP_COMPLETE for accurate CDR (not CHANNEL_HANGUP)
-            events = "CHANNEL_CREATE CHANNEL_PROGRESS CHANNEL_ANSWER CHANNEL_BRIDGE CHANNEL_HANGUP_COMPLETE"
+            events = "CHANNEL_CREATE CHANNEL_PROGRESS CHANNEL_ANSWER CHANNEL_BRIDGE CHANNEL_HANGUP_COMPLETE RECORD_START RECORD_STOP"
             fs.send(f"event plain {events}")
             logger.info(f"Subscribed to events (worker pool size: {config.EVENT_WORKER_POOL_SIZE})")
             

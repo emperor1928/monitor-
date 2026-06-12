@@ -84,13 +84,65 @@ customer_cache = CustomerCache(config.CUSTOMER_CACHE_MAX_SIZE)
 # NUMBER TO CUSTOMER LOOKUP CACHE
 # =============================================================================
 
-@lru_cache(maxsize=1000)
-def _cached_customer_lookup(number: str) -> Optional[str]:
-    """Cached Redis lookup for number -> customer_id.
+class SimpleTTLCache:
+    """A simple TTL cache implementation."""
+    def __init__(self, ttl_seconds: int, maxsize: int = 1000):
+        self.ttl = ttl_seconds
+        self.maxsize = maxsize
+        self._cache = {}
+        self._access = []
+        
+    def get(self, key):
+        if key in self._cache:
+            value, timestamp = self._cache[key]
+            if time.time() - timestamp <= self.ttl:
+                if key in self._access:
+                    self._access.remove(key)
+                self._access.append(key)
+                return value
+            else:
+                self.remove(key)
+        return None
+        
+    def set(self, key, value):
+        if key in self._cache:
+            self.remove(key)
+        elif len(self._cache) >= self.maxsize:
+            if self._access:
+                oldest = self._access.pop(0)
+                self._cache.pop(oldest, None)
+        
+        self._cache[key] = (value, time.time())
+        self._access.append(key)
+        
+    def remove(self, key):
+        self._cache.pop(key, None)
+        if key in self._access:
+            self._access.remove(key)
+            
+    def clear(self):
+        self._cache.clear()
+        self._access.clear()
 
-    Lookup key format: lookup:v1:number:<normalized_number>
-    where normalized_number is digits-only without + or country prefix.
-    """
+_customer_lookup_cache = SimpleTTLCache(
+    ttl_seconds=getattr(config, 'CUSTOMER_LOOKUP_CACHE_TTL', 300),
+    maxsize=1000
+)
+
+_extension_lookup_cache = SimpleTTLCache(
+    ttl_seconds=getattr(config, 'CUSTOMER_LOOKUP_CACHE_TTL', 300),
+    maxsize=1000
+)
+
+def get_customer_id_from_number(number: str) -> Optional[str]:
+    """Get customer_id from lookup Redis number key."""
+    if not number:
+        return None
+
+    cached = _customer_lookup_cache.get(number)
+    if cached is not None:
+        return cached if cached != "NONE" else None
+
     lookup_redis = get_lookup_redis()
     if not lookup_redis:
         return None
@@ -104,6 +156,9 @@ def _cached_customer_lookup(number: str) -> Optional[str]:
         normalized = digits[1:] if len(digits) == 11 and digits.startswith('1') else digits
         key = f"{config.LOOKUP_REDIS_NUMBER_KEY_PREFIX}:{normalized}"
         customer_id = lookup_redis.get(key)
+        
+        _customer_lookup_cache.set(number, customer_id if customer_id else "NONE")
+        
         if customer_id:
             logger.debug(f"Lookup Redis number matched {number} as {normalized}: {customer_id}")
             return customer_id
@@ -113,19 +168,15 @@ def _cached_customer_lookup(number: str) -> Optional[str]:
         return None
 
 
-def get_customer_id_from_number(number: str) -> Optional[str]:
-    """Get customer_id from lookup Redis number key."""
-    if not number:
+def get_customer_id_from_extension(extension: str) -> Optional[str]:
+    """Get customer_id from lookup Redis extension-prefix key."""
+    if not extension:
         return None
-    return _cached_customer_lookup(number)
 
+    cached = _extension_lookup_cache.get(extension)
+    if cached is not None:
+        return cached if cached != "NONE" else None
 
-@lru_cache(maxsize=1000)
-def _cached_extension_lookup(extension: str) -> Optional[str]:
-    """Cached Redis lookup for extension-prefix -> customer_id.
-
-    Example: extension 000601 resolves with key lookup:v1:ext:0006
-    """
     lookup_redis = get_lookup_redis()
     if not lookup_redis:
         return None
@@ -140,17 +191,22 @@ def _cached_extension_lookup(extension: str) -> Optional[str]:
             key = f"{config.LOOKUP_REDIS_EXT_KEY_PREFIX}:{prefixed_key}"
             customer_id = lookup_redis.get(key)
             if customer_id:
+                _extension_lookup_cache.set(extension, customer_id)
                 logger.debug(f"Lookup Redis extension matched {extension} as {prefixed_key}: {customer_id}")
                 return customer_id
 
         # Backward-compatible fallback: numeric-only extension keys.
         digits = ''.join(c for c in token if c.isdigit())
         if not digits:
+            _extension_lookup_cache.set(extension, "NONE")
             return None
 
         numeric_prefix = digits[:prefix_len]
         key = f"{config.LOOKUP_REDIS_EXT_KEY_PREFIX}:{numeric_prefix}"
         customer_id = lookup_redis.get(key)
+        
+        _extension_lookup_cache.set(extension, customer_id if customer_id else "NONE")
+        
         if customer_id:
             logger.debug(f"Lookup Redis extension matched {extension} as {numeric_prefix}: {customer_id}")
             return customer_id
@@ -160,17 +216,10 @@ def _cached_extension_lookup(extension: str) -> Optional[str]:
         return None
 
 
-def get_customer_id_from_extension(extension: str) -> Optional[str]:
-    """Get customer_id from lookup Redis extension-prefix key."""
-    if not extension:
-        return None
-    return _cached_extension_lookup(extension)
-
-
 def clear_customer_lookup_cache():
     """Clear the customer lookup cache (call at startup to clear stale entries)."""
-    _cached_customer_lookup.cache_clear()
-    _cached_extension_lookup.cache_clear()
+    _customer_lookup_cache.clear()
+    _extension_lookup_cache.clear()
     logger.info("Customer lookup cache cleared")
 
 
@@ -725,8 +774,8 @@ class CDRBatcher:
                     values = []
                     
                     for cdr in cdrs:
-                        # Each CDR has 18 parameters
-                        placeholders.append(f"(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+                        # Each CDR has 19 parameters
+                        placeholders.append(f"(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
                         
                         values.extend([
                             cdr.get("uuid"),
@@ -746,7 +795,8 @@ class CDRBatcher:
                             cdr.get("ingress_trunk") or None,
                             cdr.get("egress_trunk") or None,
                             int(cdr.get("duration", 0)),
-                            int(cdr.get("billsec", 0))
+                            int(cdr.get("billsec", 0)),
+                            bool(cdr.get("recording", False))
                         ])
                     
                     # Single bulk insert
@@ -756,7 +806,7 @@ class CDRBatcher:
                          customer_id, dest_type, dest_value, status_code, 
                          call_type, outbound_caller_id, originating_extension, 
                          originating_leg_uuid, ingress_trunk, egress_trunk, 
-                         duration, billsec)
+                         duration, billsec, recording)
                         VALUES {','.join(placeholders)}
                         ON CONFLICT (uuid) DO NOTHING
                     """
@@ -807,8 +857,8 @@ def _save_cdr_to_postgres_sync(call_data: Dict[str, Any]) -> bool:
                      customer_id, dest_type, dest_value, status_code, 
                      call_type, outbound_caller_id, originating_extension, 
                      originating_leg_uuid, ingress_trunk, egress_trunk, gateway_id, 
-                     duration, billsec, currency, transaction_id, is_rated)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     duration, billsec, currency, transaction_id, is_rated, recording)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (uuid) DO NOTHING
                 """, (
                     call_data.get("uuid"),
@@ -832,7 +882,8 @@ def _save_cdr_to_postgres_sync(call_data: Dict[str, Any]) -> bool:
                     int(call_data.get("billsec", 0)),
                     call_data.get("currency", "USD"),  # Default USD
                     int(call_data.get("transaction_id", 0)),  # Default 0
-                    call_data.get("is_rated", False)  # Default False
+                    call_data.get("is_rated", False),  # Default False
+                    bool(call_data.get("recording", False))
                 ))
                 conn.commit()
                 return True
@@ -925,6 +976,7 @@ def recover_orphan_call(uuid: str, reason: str = "stale") -> bool:
                 "ingress_trunk": redis_data.get("ingress_trunk") or "",
                 "egress_trunk": egress_trunk or redis_data.get("egress_trunk") or "",
                 "call_status": "hangup",
+                "recording": redis_data.get("recording") == "true",
             }
 
             if call_type == "OUTBOUND":
@@ -953,6 +1005,7 @@ def recover_orphan_call(uuid: str, reason: str = "stale") -> bool:
                 "ingress_trunk": "",
                 "egress_trunk": "",
                 "call_status": "hangup",
+                "recording": False,
             }
 
         if not save_cdr_to_postgres(cdr):
@@ -1243,6 +1296,7 @@ def handle_hangup_complete(event_dict: Dict[str, str]):
                 event_type = "no_answer"
         
         # Build CDR
+        recording = redis_data.get("recording") == "true"
         cdr = {
             "uuid": uuid,
             "b_uuid": redis_data.get("b_uuid"),
@@ -1260,6 +1314,7 @@ def handle_hangup_complete(event_dict: Dict[str, str]):
             "ingress_trunk": redis_data.get("ingress_trunk"),
             "egress_trunk": egress_trunk or event_dict.get("variable_default_gateway", ""),
             "call_status": "hangup",
+            "recording": recording,
         }
         
         # Type-specific fields
@@ -1292,6 +1347,37 @@ def handle_hangup_complete(event_dict: Dict[str, str]):
         logger.error(f"HANGUP error: {e}", exc_info=True)
 
 
+def handle_record_start(event_dict: Dict[str, str]):
+    """Handle RECORD_START - set recording flag to true."""
+    try:
+        uuid = event_dict.get("Unique-ID")
+        call_data = get_call_from_redis(uuid)
+        if not call_data:
+            return
+        
+        call_data["recording"] = "true"
+        if not store_call_in_redis(call_data):
+            stats.error()
+            logger.error(f"RECORD_START state store failed: {uuid[:8]}...")
+            return
+        stats.increment()
+        logger.info(f"RECORD_START: {uuid[:8]}... recording enabled")
+    except Exception as e:
+        stats.error()
+        logger.error(f"RECORD_START error: {e}")
+
+
+def handle_record_stop(event_dict: Dict[str, str]):
+    """Handle RECORD_STOP - keep recording flag to true if we already started."""
+    try:
+        uuid = event_dict.get("Unique-ID")
+        logger.info(f"RECORD_STOP: {uuid[:8]}...")
+        stats.increment()
+    except Exception as e:
+        stats.error()
+        logger.error(f"RECORD_STOP error: {e}")
+
+
 # CHANNEL_DESTROY removed - cleanup done in CHANNEL_HANGUP_COMPLETE
 # CHANNEL_HANGUP removed - using CHANNEL_HANGUP_COMPLETE for accuracy
 
@@ -1306,6 +1392,8 @@ EVENT_HANDLERS = {
     "CHANNEL_ANSWER": handle_answer,
     "CHANNEL_BRIDGE": handle_bridge,
     "CHANNEL_HANGUP_COMPLETE": handle_hangup_complete,
+    "RECORD_START": handle_record_start,
+    "RECORD_STOP": handle_record_stop,
 }
 
 
