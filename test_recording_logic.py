@@ -60,21 +60,61 @@ def run_test():
         mock_redis.pipeline.return_value = mock_redis
         mock_redis.execute.return_value = [True]
 
-        # 1. Simulate RECORD_START event
+        # 1. Simulate RECORD_START event directly on A-leg
         record_start_event = {
             "Event-Name": "RECORD_START",
             "Unique-ID": call_uuid,
             "Record-File-Path": "/var/lib/freeswitch/recordings/test.mp3"
         }
         
-        logger.info("Triggering handle_record_start...")
+        logger.info("Triggering handle_record_start for A-leg directly...")
         handlers.handle_record_start(record_start_event)
-        
-        # Verify recording flag is set to "true" in Redis store
         assert mock_redis_store.get("recording") == "true", "Failed: Recording flag should be 'true' in Redis after RECORD_START."
-        logger.info("Success: handle_record_start updated Redis successfully.")
+        logger.info("Success: handle_record_start updated Redis successfully for A-leg.")
 
-        # 2. Simulate CHANNEL_HANGUP_COMPLETE event
+        # Reset recording flag
+        mock_redis_store["recording"] = "false"
+
+        # 2. Simulate B-leg mapping in Redis and RECORD_START event on B-leg
+        bleg_uuid = "test-bleg-99999"
+        mock_redis_mappings = {
+            f"bleg_mapping:{bleg_uuid}": call_uuid
+        }
+
+        # Mock Redis get to return B-leg mapping
+        def get_mock_v3(key):
+            return mock_redis_mappings.get(key)
+        mock_redis.get.side_effect = get_mock_v3
+
+        record_start_bleg_event = {
+            "Event-Name": "RECORD_START",
+            "Unique-ID": bleg_uuid,
+            "Record-File-Path": "/var/lib/freeswitch/recordings/something.mp3"
+        }
+
+        logger.info("Triggering handle_record_start for B-leg (mapped to A-leg)...")
+        handlers.handle_record_start(record_start_bleg_event)
+        assert mock_redis_store.get("recording") == "true", "Failed: Recording flag should be 'true' in Redis after B-leg RECORD_START mapping match."
+        logger.info("Success: handle_record_start updated Redis successfully for B-leg mapping.")
+
+        # Reset recording flag and mappings
+        mock_redis_store["recording"] = "false"
+        mock_redis_mappings.clear()
+
+        # 3. Simulate RECORD_START event on B-leg using Record-File-Path fallback
+        # The file path has the A-leg UUID as the filename
+        record_start_filepath_event = {
+            "Event-Name": "RECORD_START",
+            "Unique-ID": bleg_uuid,
+            "Record-File-Path": f"/var/lib/freeswitch/recordings/{call_uuid}.mp3"
+        }
+
+        logger.info("Triggering handle_record_start using Record-File-Path fallback...")
+        handlers.handle_record_start(record_start_filepath_event)
+        assert mock_redis_store.get("recording") == "true", "Failed: Recording flag should be 'true' in Redis after B-leg RECORD_START filepath fallback match."
+        logger.info("Success: handle_record_start updated Redis successfully via filepath fallback.")
+
+        # 4. Simulate CHANNEL_HANGUP_COMPLETE event
         hangup_event = {
             "Event-Name": "CHANNEL_HANGUP_COMPLETE",
             "Unique-ID": call_uuid,
@@ -104,7 +144,7 @@ def run_test():
         
         logger.info("Success: handle_hangup_complete finalized CDR with recording=True.")
         
-        # 3. Simulate call without RECORD_START (unanswered call)
+        # 5. Simulate call without RECORD_START (unanswered call)
         call_uuid_no_rec = "test-uuid-no-rec"
         mock_redis_store_no_rec = {
             "uuid": call_uuid_no_rec,
