@@ -547,6 +547,18 @@ def remove_call_from_redis(uuid: str, customer_id: str):
     try:
         pipe = redis_client.pipeline(transaction=False)
         key_customer = customer_cache.get(uuid) or customer_id or "unknown"
+        
+        # Clean up B-leg mappings if present
+        try:
+            b_uuid = redis_client.hget(_primary_call_key(uuid), "b_uuid")
+            if b_uuid:
+                if isinstance(b_uuid, bytes):
+                    b_uuid = b_uuid.decode('utf-8')
+                pipe.delete(f"bleg_mapping:{b_uuid}")
+        except Exception as e:
+            logger.error(f"Failed to query b_uuid for B-leg mapping removal: {e}")
+        pipe.delete(f"bleg_mapping:{uuid}")
+        
         # Remove primary key
         pipe.delete(_primary_call_key(uuid))
         # Remove current known compatibility key
@@ -1107,6 +1119,14 @@ def handle_create(event_dict: Dict[str, str]):
             if not a_leg:
                 return
                 
+            # Store B-leg mapping to A-leg in Redis for fast leg-agnostic lookup (e.g. RECORD_START)
+            redis_client = get_redis()
+            if redis_client:
+                try:
+                    redis_client.set(f"bleg_mapping:{uuid}", other_leg, ex=config.REDIS_CALL_TTL)
+                except Exception as e:
+                    logger.error(f"Failed to store B-leg mapping in Redis: {e}")
+                
             # Capture forward indicators
             rdnis = event_dict.get("Caller-RDNIS", "")  # KEY FIELD for DID_FORWARD
             b_dest = (
@@ -1347,14 +1367,80 @@ def handle_hangup_complete(event_dict: Dict[str, str]):
         logger.error(f"HANGUP error: {e}", exc_info=True)
 
 
+def get_call_by_any_leg(event_dict: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Helper to find call data in Redis from either A-leg or B-leg UUID."""
+    # 1. Try directly with Unique-ID (assuming it's A-leg)
+    uuid = event_dict.get("Unique-ID")
+    if uuid:
+        call_data = get_call_from_redis(uuid)
+        if call_data:
+            return call_data
+            
+    # 2. Try with B-leg mapping from Redis (maps B-leg UUID to A-leg UUID)
+    if uuid:
+        redis_client = get_redis()
+        if redis_client:
+            try:
+                a_uuid = redis_client.get(f"bleg_mapping:{uuid}")
+                if a_uuid:
+                    if isinstance(a_uuid, bytes):
+                        a_uuid = a_uuid.decode('utf-8')
+                    call_data = get_call_from_redis(a_uuid)
+                    if call_data:
+                        return call_data
+            except Exception as e:
+                logger.error(f"Error querying B-leg mapping in Redis: {e}")
+
+    # 3. Try with Other-Leg-Unique-ID (if the event was on B-leg)
+    other_leg = event_dict.get("Other-Leg-Unique-ID")
+    if other_leg:
+        call_data = get_call_from_redis(other_leg)
+        if call_data:
+            return call_data
+            
+    # 4. Try with variable_originating_leg_uuid (another standard FS link header)
+    orig_leg = event_dict.get("variable_originating_leg_uuid")
+    if orig_leg:
+        call_data = get_call_from_redis(orig_leg)
+        if call_data:
+            return call_data
+
+    # 5. Try with variable_bridge_uuid
+    bridge_uuid = event_dict.get("variable_bridge_uuid")
+    if bridge_uuid:
+        call_data = get_call_from_redis(bridge_uuid)
+        if call_data:
+            return call_data
+            
+    # 6. Fallback: Parse A-leg UUID from Record-File-Path if present
+    record_path = event_dict.get("Record-File-Path")
+    if record_path:
+        try:
+            import os
+            basename = os.path.basename(record_path)
+            filename_no_ext = os.path.splitext(basename)[0]
+            if filename_no_ext:
+                call_data = get_call_from_redis(filename_no_ext)
+                if call_data:
+                    return call_data
+        except Exception as e:
+            logger.error(f"Error parsing A-leg UUID from Record-File-Path: {e}")
+            
+    return None
+
+
 def handle_record_start(event_dict: Dict[str, str]):
     """Handle RECORD_START - set recording flag to true."""
     try:
-        uuid = event_dict.get("Unique-ID")
-        call_data = get_call_from_redis(uuid)
+        call_data = get_call_by_any_leg(event_dict)
         if not call_data:
+            logger.warning(
+                f"RECORD_START: Call leg not found for Unique-ID={event_dict.get('Unique-ID')} "
+                f"or Other-Leg={event_dict.get('Other-Leg-Unique-ID')}"
+            )
             return
         
+        uuid = call_data.get("uuid")
         call_data["recording"] = "true"
         if not store_call_in_redis(call_data):
             stats.error()
@@ -1370,7 +1456,8 @@ def handle_record_start(event_dict: Dict[str, str]):
 def handle_record_stop(event_dict: Dict[str, str]):
     """Handle RECORD_STOP - keep recording flag to true if we already started."""
     try:
-        uuid = event_dict.get("Unique-ID")
+        call_data = get_call_by_any_leg(event_dict)
+        uuid = call_data.get("uuid") if call_data else event_dict.get("Unique-ID")
         logger.info(f"RECORD_STOP: {uuid[:8]}...")
         stats.increment()
     except Exception as e:
