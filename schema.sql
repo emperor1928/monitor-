@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS live_call_events (
     egress_trunk VARCHAR(100),  -- Destination trunk/gateway
     duration INTEGER DEFAULT 0,  -- Total call duration in seconds (from create to hangup)
     billsec INTEGER DEFAULT 0,  -- Billable duration in seconds (from answer to hangup)
+    recording BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
